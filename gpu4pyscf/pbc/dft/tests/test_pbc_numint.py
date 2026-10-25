@@ -381,6 +381,45 @@ S
         ref = ni.to_cpu().eval_rho(cell, ao_cpu, dm.get(), xctype='LDA')
         self.assertAlmostEqual(abs(rho.get() - ref).max(), 0, 12)
 
+    def test_knumint_eval_rho_k_batch(self):
+        rng = np.random.default_rng(712)
+        nao = cell.nao
+        ni = numint.KNumInt()
+        for dtype, mixed in ((cp.float32, False), (cp.float64, False),
+                             (cp.complex64, False), (cp.complex128, False),
+                             (cp.complex128, True)):
+            ao = rng.normal(size=(7, 4, 11, nao))
+            dm = rng.normal(size=(7, nao, nao))
+            if np.issubdtype(dtype, np.complexfloating):
+                if not mixed:
+                    ao = ao + 1j*rng.normal(size=ao.shape)
+                dm = dm + 1j*rng.normal(size=dm.shape)
+            ao = cp.asarray(ao, dtype=cp.float64 if mixed else dtype)
+            dm = cp.asarray(dm, dtype=dtype)
+            for hermi in (0, 1, 2):
+                dms = dm if hermi == 0 else dm + (1 if hermi == 1 else -1)*dm.conj().swapaxes(-1, -2)
+                for xctype in ('LDA', 'HF', 'GGA', 'MGGA'):
+                    aos = ao[:, 0] if xctype in ('LDA', 'HF') else ao
+                    for nk in (1, 7):
+                        with lib.temporary_env(numint, K_BATCH_SIZE=0):
+                            ref = ni.eval_rho(cell, aos[:nk], dms[:nk], xctype=xctype, hermi=hermi)
+                        for batch in (1, 3, 16):
+                            with self.subTest(dtype=dtype, mixed=mixed, hermi=hermi,
+                                              xctype=xctype, nk=nk, batch=batch):
+                                with lib.temporary_env(numint, K_BATCH_SIZE=batch):
+                                    rho = cp.concatenate([
+                                        ni.eval_rho(cell, aos[:nk, ..., g:g+4, :], dms[:nk],
+                                                    xctype=xctype, hermi=hermi)
+                                        for g in range(0, 11, 4)], axis=-1)
+                                self.assertEqual(rho.dtype, ref.dtype)
+                                tol = 2e-5 if dtype in (cp.float32, cp.complex64) else 1e-12
+                                cp.testing.assert_allclose(rho, ref, atol=tol, rtol=tol)
+        # MGGA Laplacians are unsupported in both single-k and batched paths.
+        for batch in (0, 3):
+            with lib.temporary_env(numint, K_BATCH_SIZE=batch), self.assertRaises(AssertionError):
+                ni.eval_rho(cell, cp.ones((1, 4, 11, nao)), cp.eye(nao)[None],
+                            xctype='MGGA', hermi=1, with_lapl=True)
+
     def test_uniform_grid_division_mode(self):
         grids = gen_grid.UniformGrids(cell)
         grids.mesh = [20, 20, 20]

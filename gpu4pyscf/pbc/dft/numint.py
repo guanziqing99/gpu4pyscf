@@ -41,6 +41,7 @@ from gpu4pyscf import __config__
 __all__ = ['NumInt', 'KNumInt']
 
 MIN_BLK_SIZE = getattr(__config__, 'min_grid_blksize', 4096)
+K_BATCH_SIZE = getattr(__config__, 'k_batch_size', 0)
 ALIGNED = getattr(__config__, 'grid_aligned', 16*16)
 LMAX = 4
 
@@ -741,6 +742,10 @@ class KNumInt(lib.StreamObject, numint.LibXCMixin):
            rhoR : (ngrids,) ndarray
         '''
         nkpts = len(ao_kpts)
+        k_batch_size = K_BATCH_SIZE
+        if k_batch_size > 0:
+            return self._eval_rho_batched(cell, ao_kpts, dm_kpts,
+                                          k_batch_size, xctype, hermi, with_lapl)
         rho_ks = [eval_rho(cell, ao_kpts[k], dm_kpts[k], non0tab, xctype,
                            hermi, with_lapl, verbose)
                   for k in range(nkpts)]
@@ -752,6 +757,58 @@ class KNumInt(lib.StreamObject, numint.LibXCMixin):
             rho += rho_ks[k]
         rho *= 1./nkpts
         return rho
+
+    def _eval_rho_batched(self, cell, ao_kpts, dm_kpts, k_batch_size,
+                          xctype, hermi, with_lapl):
+        """Evaluate LDA/GGA/MGGA density in k batches using single-k formulas.
+        Average over all k points; MGGA Laplacians remain unsupported.
+        """
+        nkpts = len(ao_kpts)
+        ngrids, nao = ao_kpts.shape[-2:]
+        assert nkpts > 0 and nao == cell.ao_loc_nr()[-1]
+        assert dm_kpts.shape == (nkpts, nao, nao)
+        complex_data = cp.iscomplexobj(ao_kpts) or cp.iscomplexobj(dm_kpts)
+        if complex_data:
+            dtype = np.complex128
+        else:
+            assert ao_kpts.dtype == dm_kpts.dtype
+            dtype = ao_kpts.dtype
+        lda = xctype in ('LDA', 'HF')
+        density_dtype = (np.complex128 if complex_data and hermi != 1 else
+                         dtype if lda and not complex_data else np.float64)
+        mgga = not lda and xctype != 'GGA'
+        if mgga:
+            assert not with_lapl
+        rho = cp.zeros((1 if lda else 5 if mgga else 4, ngrids),
+                       dtype=density_dtype)
+
+        def dot_bra(bra, ket):
+            value = cp.sum(bra.conj() * ket, axis=(0, 2))
+            return value.real if hermi == 1 or not complex_data else value
+
+        for k0, k1 in lib.prange(0, nkpts, k_batch_size):
+            ao = cp.asarray(ao_kpts[k0:k1], dtype=dtype)
+            dm = cp.asarray(dm_kpts[k0:k1], dtype=dtype)
+            a0 = ao if lda else ao[:, 0]
+            c0 = cp.matmul(a0, dm)
+            rho[0] += dot_bra(a0, c0)
+            if lda:
+                continue
+            # GGA's non-Hermitian path uses the adjoint density contraction.
+            if not mgga and hermi != 1:
+                c_adjoint = cp.matmul(a0, dm.conj().swapaxes(-1, -2))
+            for component in range(1, 4):
+                gradient = dot_bra(ao[:, component], c0)
+                if mgga:
+                    c1 = cp.matmul(ao[:, component], dm)
+                    rho[4] += .5 * dot_bra(ao[:, component], c1)
+                    if hermi != 1:
+                        gradient += dot_bra(a0, c1)
+                elif hermi != 1:
+                    gradient += dot_bra(c_adjoint, ao[:, component])
+                rho[component] += gradient * (2 if hermi == 1 else 1)
+        rho /= nkpts
+        return rho[0] if lda else rho
 
     def block_loop(self, cell, grids, deriv=0, kpts=None, sort_grids=False):
         '''Define this macro to loop over grids by blocks.
